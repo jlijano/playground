@@ -23,15 +23,102 @@ function account_confirmation_url(string $path): string
     return account_confirmation_base_url() . '/' . ltrim($path, '/');
 }
 
-function account_confirmation_from_header(): string
+function account_confirmation_from_email(): string
 {
     $from = trim((string) getenv('PORTAL_MAIL_FROM'));
     if ($from === '' || !filter_var($from, FILTER_VALIDATE_EMAIL)) {
-        $host = parse_url(account_confirmation_base_url(), PHP_URL_HOST) ?: 'oligarchyservices.com';
-        $from = 'no-reply@' . preg_replace('/^www\./', '', strtolower((string) $host));
+        $from = 'sentinel@oligarchyservices.com';
     }
 
-    return 'Oligarchy Services <' . $from . '>';
+    return $from;
+}
+
+function account_confirmation_from_header(): string
+{
+    return 'Oligarchy Services <' . account_confirmation_from_email() . '>';
+}
+
+function account_confirmation_orchestrator_url(): string
+{
+    $url = trim((string) getenv('PORTAL_MAIL_ORCHESTRATOR_URL'));
+    if ($url === '' || !preg_match('#^https?://#i', $url)) {
+        return '';
+    }
+
+    $url = rtrim($url, '/');
+    if (!preg_match('#/send-email$#', $url)) {
+        $url .= '/send-email';
+    }
+
+    return $url;
+}
+
+function account_confirmation_send_via_orchestrator(string $email, string $subject, string $body): bool
+{
+    $url = account_confirmation_orchestrator_url();
+    $token = trim((string) getenv('PORTAL_MAIL_ORCHESTRATOR_TOKEN'));
+    if ($url === '' || $token === '') {
+        return false;
+    }
+
+    $payload = json_encode([
+        'to' => $email,
+        'from' => account_confirmation_from_email(),
+        'subject' => $subject,
+        'text' => $body,
+        'body' => $body,
+        'source' => 'account-confirmation',
+    ], JSON_UNESCAPED_SLASHES);
+    if ($payload === false) {
+        return false;
+    }
+
+    $headers = [
+        'Content-Type: application/json',
+        'Authorization: Bearer ' . $token,
+        'X-Orchestrator-Token: ' . $token,
+    ];
+
+    if (function_exists('curl_init')) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_CONNECTTIMEOUT => 5,
+            CURLOPT_TIMEOUT => 12,
+        ]);
+        curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+
+        if ($status >= 200 && $status < 300) {
+            return true;
+        }
+
+        error_log('Account confirmation orchestrator send failed with HTTP ' . $status . ($error !== '' ? ': ' . $error : ''));
+        return false;
+    }
+
+    $context = stream_context_create([
+        'http' => [
+            'method' => 'POST',
+            'header' => implode("\r\n", $headers),
+            'content' => $payload,
+            'timeout' => 12,
+            'ignore_errors' => true,
+        ],
+    ]);
+    $result = @file_get_contents($url, false, $context);
+    $statusLine = $http_response_header[0] ?? '';
+    if ($result !== false && preg_match('#^HTTP/\S+\s+2\d\d\b#', $statusLine)) {
+        return true;
+    }
+
+    error_log('Account confirmation orchestrator send failed: ' . ($statusLine ?: 'no HTTP response'));
+    return false;
 }
 
 function account_confirmation_send_email(string $email, string $name, string $token): bool
@@ -46,6 +133,11 @@ function account_confirmation_send_email(string $email, string $name, string $to
         . "After confirming, log in here and create your own password before opening the dashboard:\n\n"
         . "{$loginUrl}\n\n"
         . "This confirmation link expires in 48 hours.\n";
+
+    if (account_confirmation_send_via_orchestrator($email, $subject, $body)) {
+        return true;
+    }
+
     $headers = [
         'From: ' . account_confirmation_from_header(),
         'Reply-To: ' . account_confirmation_from_header(),
@@ -110,7 +202,7 @@ function account_confirmation_finalize_dashboard_create(): void
             $_SESSION['dashboard_notice'] = 'User created. Confirmation email sent to ' . $email . '.';
         } else {
             unset($_SESSION['dashboard_notice']);
-            $_SESSION['dashboard_error'] = 'User created, but the confirmation email could not be sent. Check Hostinger PHP mail settings.';
+            $_SESSION['dashboard_error'] = 'User created, but the confirmation email could not be sent. Check Sentinel mail orchestrator settings and Hostinger PHP mail settings.';
         }
     } catch (Throwable $error) {
         error_log('Account confirmation setup failed: ' . $error->getMessage());
@@ -118,3 +210,5 @@ function account_confirmation_finalize_dashboard_create(): void
         $_SESSION['dashboard_error'] = 'User created, but account confirmation setup failed. Check the PHP error log.';
     }
 }
+
+account_confirmation_register_dashboard_hook();
